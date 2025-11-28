@@ -1,0 +1,2 @@
+GIFs: gifs/gifs
+Story: gif_storyboarding/gif_storyboarding
