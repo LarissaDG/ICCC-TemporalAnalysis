@@ -1,40 +1,50 @@
 import os
 import sys
+from pathlib import Path
 sys.path.append('/home_cerberus/disk3/larissa.gomide/APDDv2/')
+
 import torch
 import numpy as np
 import warnings
 import models.clip as clip
 warnings.filterwarnings("ignore")
 from models.aesclip import AesCLIP_reg
-from PIL import ImageFile
-from PIL import Image
+from PIL import ImageFile, Image
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 import argparse
 import pandas as pd
-from tqdm import tqdm
 
+
+# =======================================================
+#   CLI
+# =======================================================
 def init():
     parser = argparse.ArgumentParser(description="PyTorch Aesthetic Scoring")
+
+    parser.add_argument(
+        "--single",
+        action="store_true",
+        help="Se ativo, processa apenas a primeira linha do CSV"
+    )
+
     args = parser.parse_args()
     return args
 
+
 opt = init()
 
+
+# =======================================================
+#   Funções de apoio
+# =======================================================
 def get_score(opt, y_pred):
-    """
-    Retorna a predição do modelo e seu valor numérico em numpy.
-    """
     score_np = y_pred.data.cpu().numpy()
     return y_pred, score_np
 
+
 def load_model(weight_path, device):
-    """
-    Tenta carregar o modelo AesCLIP_reg a partir do caminho do peso.
-    Em caso de falha, exibe uma mensagem e retorna None.
-    """
     try:
-        # O peso base do AesCLIP é fixo
         base_weight = "/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/0.AesCLIP_weight--e11-train2.4314-test4.0253_best.pth"
         model = AesCLIP_reg(clip_name='ViT-B/16', weight=base_weight)
         model.load_state_dict(torch.load(weight_path))
@@ -46,134 +56,110 @@ def load_model(weight_path, device):
         print(f"Falha ao carregar modelo de {weight_path}: {e}")
         return None
 
+
 def evaluate_image(image_path, models_dict, preprocess, opt, device):
-    """
-    Dada uma imagem (caminho) e um dicionário de modelos,
-    processa a imagem com o preprocess do CLIP e retorna um dicionário
-    com os scores para cada métrica.
-    """
     try:
         image = Image.open(image_path).convert("RGB")
     except Exception as e:
         print(f"Erro ao abrir imagem {image_path}: {e}")
         return {col: np.nan for col in models_dict.keys()}
-    
+
     try:
         image_input = preprocess(image).unsqueeze(0).to(device)
     except Exception as e:
         print(f"Erro ao preprocessar imagem {image_path}: {e}")
         return {col: np.nan for col in models_dict.keys()}
-    
+
     scores = {}
     for col, model in models_dict.items():
         if model is not None:
             try:
                 pred = model(image_input)
                 _, pred_val = get_score(opt, pred)
-                # Se for um único valor, extraí-lo
+
                 if isinstance(pred_val, np.ndarray) and pred_val.size == 1:
                     pred_val = pred_val.item()
-                # Ajuste especial para o score total (multiplica por 10)
+
                 if col == "Total aesthetic score":
                     pred_val = pred_val * 10
+
                 scores[col] = pred_val
             except Exception as e:
                 print(f"Erro ao prever {col} para imagem {image_path}: {e}")
                 scores[col] = np.nan
         else:
             scores[col] = np.nan
+
     return scores
 
-def process_csv(input_csv, output_csv, models_dict, preprocess, opt, device, cols_to_compare):
-    """
-    Abre o CSV com encoding 'utf-8' (ou 'latin1' em caso de falha), 
-    para cada linha avalia a imagem (caminho presente em 'generated_filename')
-    e preenche as colunas de comparação com os scores retornados pelos modelos.
-    Ao final, salva a tabela atualizada no arquivo de saída.
-    """
+
+# =======================================================
+#   PROCESSAMENTO DO CSV
+# =======================================================
+def process_csv(base_dir, input_csv, output_csv, models_dict, preprocess, opt, device, cols_to_compare):
+
+    print(f"\n📄 Lendo CSV: {input_csv}")
+
     try:
         df = pd.read_csv(input_csv, encoding="utf-8")
-    except Exception as e:
-        print(f"Erro ao ler {input_csv} com utf-8: {e}. Tentando latin1...")
+    except Exception:
         df = pd.read_csv(input_csv, encoding="latin1")
-    
+
+    if opt.single:
+        print("⚠️ Rodando SOMENTE a primeira linha (--single)")
+        df = df.iloc[[0]].copy()
+
     for idx, row in df.iterrows():
-        image_path = row.get("generated_filename")
+        image_path = os.path.join("dataset", row.get("oficial_path"))
+
         if not image_path or not os.path.exists(image_path):
-            print(f"Imagem não encontrada para a linha {idx}: {image_path}")
+            print(f"⚠️ Imagem NÃO encontrada na linha {idx}: {image_path}")
             for col in cols_to_compare:
                 df.loc[idx, col] = np.nan
             continue
-        
+
         scores = evaluate_image(image_path, models_dict, preprocess, opt, device)
         for col in cols_to_compare:
             df.loc[idx, col] = scores.get(col, np.nan)
-        print(f"Linha {idx} processada.")
-    
+
+        print(f"✔ Linha {idx} processada")
+
     df.to_csv(output_csv, index=False)
-    print(f"Arquivo salvo: {output_csv}")
+    print(f"💾 Arquivo salvo em: {output_csv}")
 
 
-def process_csv(input_csv, output_csv, models_dict, preprocess, opt, device, cols_to_compare):
-
-    print(f"\n📄 Lendo CSV: {input_csv}")
-    df = pd.read_csv(input_csv)
-
-    print(f"🔍 Total de linhas: {len(df)}")
-
-    results = []
-
-    # tqdm aplicado na iteração
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processando linhas", unit="linha"):
-
-        # Aqui você chama sistema de predição normalmente
-        res = {}
-
-        for col in cols_to_compare:
-            text = row[col]
-            score = infer_score(text, models_dict, preprocess, opt, device)  # <-- sua função interna
-            res[col] = score
-
-        results.append(res)
-
-    # Merge dos resultados ao dataframe
-    result_df = pd.DataFrame(results)
-    final_df = pd.concat([df, result_df], axis=1)
-
-    # Salvar CSV final
-    final_df.to_csv(output_csv, index=False)
-    print(f"💾 CSV salvo em: {output_csv}")
-
-    return final_df
-
-
+# =======================================================
+#   MAIN
+# =======================================================
 def main():
-    # Define o dispositivo
+
+    # ---------------------------------------------------
+    #  GPU
+    # ---------------------------------------------------
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    
-    # Carrega o preprocess do CLIP (ViT-B/16)
     _, preprocess = clip.load('ViT-B/16', device)
-    
-    # Carrega os modelos com try/except (não interrompe a execução em caso de falha)
+
+    # ---------------------------------------------------
+    #  Carregar modelos
+    # ---------------------------------------------------
     score_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/1.Score_reg_weight--e4-train0.4393-test0.6835_best.pth", device)
     theme_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/2.Theme and logic_reg_weight--e5-train0.3792-test0.5953_best.pth", device)
     creativity_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/3.Creativity_reg_weight--e5-train0.4212-test0.7122_best.pth", device)
     layout_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/4.Layout and composition_reg_weight--e6-train0.2783-test0.6342_best.pth", device)
     space_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/5.Space and perspective_reg_weight--e7-train0.2168-test0.5998_best.pth", device)
-    # O modelo 6 (Sense of Order) foi renomeado para Model_6.pth
     sense_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/Model_6.pth", device)
     light_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/7.Light and shadow_reg_weight--e7-train0.1937-test0.6518_best.pth", device)
     color_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/8.Color_reg_weight--e5-train0.2905-test0.5871_best.pth", device)
     details_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/9.Details and texture_reg_weight--e4-train0.4385-test0.7034_best.pth", device)
     overall_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/10.The overall_reg_weight--e3-train0.5131-test0.6343_best.pth", device)
     mood_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/11.Mood_reg_weight--e7-train0.3108-test0.7097_best.pth", device)
-    
-    # Mapeia os modelos para os nomes das colunas a serem preenchidas
+
     cols_to_compare = [
         "Total aesthetic score", "Theme and logic", "Creativity", "Layout and composition",
         "Space and perspective", "The sense of order", "Light and shadow", "Color",
         "Details and texture", "The overall", "Mood"
     ]
+
     models_dict = {
         "Total aesthetic score": score_model,
         "Theme and logic": theme_model,
@@ -187,42 +173,63 @@ def main():
         "The overall": overall_model,
         "Mood": mood_model
     }
-    
-	print("\n=== PROCESSANDO TODOS OS CSVs NOS DATASETS ===")
 
-	datasets = [d for d in base_dir.iterdir() if d.is_dir()]
+    # ---------------------------------------------------
+    #  Diretório base com as duas pastas
+    # ---------------------------------------------------
+    base_dir = Path("/sonic_home/larissa.gomide/dataset")
 
-	for dataset in datasets:
-	    print(f"\n📁 Dataset: {dataset.name}")
+    folders = ["gif_storyboarding", "gifs"]
 
-	    # Lista CSVs na pasta raiz do dataset
-	    csv_files = list(dataset.glob("*.csv"))
+    for folder in folders:
+        folder_path = base_dir / "dataset" / folder
 
-	    if not csv_files:
-	        print("  ⚠ Nenhum CSV encontrado.")
-	        continue
+        print(f"\n📁 Processando pasta: {folder_path}")
 
-	    print(f"  Encontrados {len(csv_files)} CSVs. Processando...")
+        # ============================================================
+        #   FILTRO: só pegar *_dataset.csv e ignorar tudo com _scored
+        # ============================================================
+        csv_files = []
+        for f in folder_path.glob("*_dataset*.csv"):
+            name = f.name
 
-	    for csv_in in tqdm(csv_files, desc=f"  CSVs em {dataset.name}", unit="csv"):
+            # Ignorar CSVs com mais de um _scored
+            if name.count("_scored") > 1:
+                continue
 
-	        csv_out = csv_in.with_name(csv_in.stem + "_scored.csv")
+            # Ignorar arquivos que JÁ são scored
+            if name.endswith("_scored.csv"):
+                continue
 
-	        print(f"\n📄 Arquivo:")
-	        print(f"   Entrada: {csv_in.name}")
-	        print(f"   Saída  : {csv_out.name}")
+            # Aceitar apenas o original: *_dataset.csv
+            if name.endswith("_dataset.csv"):
+                csv_files.append(f)
 
-	        process_csv(
-	            str(csv_in),
-	            str(csv_out),
-	            models_dict,
-	            preprocess,
-	            opt,
-	            device,
-	            cols_to_compare
-	        )
+        csv_files = sorted(csv_files)
 
-	print("\n✔ TODOS OS CSVs foram processados com sucesso!")
+        if not csv_files:
+            print(f"⚠️ Nenhum CSV ORIGINAL encontrado em: {folder_path}")
+            continue
+
+        for csv_in in csv_files:
+            csv_out = folder_path / (csv_in.stem + "_scored.csv")
+
+            print(f"\n➡️ Entrada: {csv_in}")
+            print(f"⬅️ Saída : {csv_out}")
+
+            process_csv(
+                base_dir,
+                str(csv_in),
+                str(csv_out),
+                models_dict,
+                preprocess,
+                opt,
+                device,
+                cols_to_compare
+            )
+
+    print("\n✔ TODOS OS CSVs foram processados com sucesso!")
+
 
 if __name__ == "__main__":
     main()
