@@ -1,13 +1,5 @@
-# temporal_pipeline_experiments_build.py
+# 04-prepara_dataset.py
 # -*- coding: utf-8 -*-
-
-"""
-VERSÃO REESCRITA:
-- Agora NÃO amostra nem renomeia mais vídeos.
-- Usa diretamente a pasta videos_amostrados_raw/ como entrada.
-- Só faz: conversão → extração → H1/H2 → CSVs.
-- Ideal para rodar no SLURM.
-"""
 
 import os
 from pathlib import Path
@@ -34,24 +26,24 @@ from colorama import Fore, Style
 from scipy import stats
 
 # =====================================================================
-# CONFIGURAÇÃO
+# CONFIGURAÇÃO GLOBAL
 # =====================================================================
 
-RAW_DIR = Path("videos_amostrados_raw")     # << agora SEU PONTO DE ENTRADA
-WORK_DIR = Path("videos_amostrados_mp4")    # onde os mp4 convertidos vão
-DATASET_DIR = Path("dataset")               # onde vai ficar o dataset final
+RAW_DIR = Path("videos_amostrados_raw")
+WORK_DIR = Path("videos_amostrados_mp4")
+FRAMES_ORIGINAIS_DIR = Path("frames_originais")
+FRAMES_RUIDOS_H1_DIR = Path("frames_ruidos_h1")
+FRAMES_INTENSIDADES_H2_DIR = Path("frames_intensidades_h2")
+ORQUESTRADOR_DIR = Path("orquestrador_experimentos")
 
 NOISE_TYPES = ["blur_sp", "shapes_x", "gaussian"]
 VIDEO_EXTS = [".mp4", ".webm", ".mov", ".avi", ".gif", ".mkv"]
 
-SCORE_COLUMNS = [
-    "Total aesthetic score", "Theme and logic", "Creativity", "Layout and composition",
-    "Space and perspective", "Light and shadow", "Color", "The sense of order",
-    "Details and texture", "The overall", "Mood"
-]
-
 random.seed(42)
+np.random.seed(42)
 
+imageio.plugins.ffmpeg.ALLOW_EXEC = True
+print("✅ imageio configurado para usar ffmpeg para leitura/escrita de vídeo.")
 
 # =====================================================================
 # UTIL
@@ -60,15 +52,13 @@ random.seed(42)
 def list_videos(folder: Path):
     return sorted([p for p in folder.iterdir() if p.suffix.lower() in VIDEO_EXTS])
 
-
 def slugify(text: str) -> str:
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[^a-zA-Z0-9_-]+", "_", text)
     return text.strip("_") or "video"
 
-
 # =====================================================================
-# CONVERSÃO MP4
+# CONVERSÃO MP4 (Usando imageio para robustez)
 # =====================================================================
 
 def _convert_single(task):
@@ -77,135 +67,86 @@ def _convert_single(task):
         if dst.exists():
             return src, dst, True, "", True  # skipped
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(src),
-            "-vcodec", "libx264",
-            "-acodec", "aac",
-            str(dst)
-        ]
+        reader = imageio.get_reader(str(src), "ffmpeg")
+        fps = reader.get_meta_data().get("fps", 30)
+        writer = imageio.get_writer(str(dst), fps=fps, codec='libx264', output_params=['-pix_fmt', 'yuv420p'])
 
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        if proc.returncode != 0:
-            return src, dst, False, proc.stderr.decode("utf-8"), False
+        for frame in reader:
+            writer.append_data(frame)
+        
+        writer.close()
+        reader.close()
 
         return src, dst, True, "", False
 
     except Exception as e:
-        return src, dst, False, str(e), False
-
+        error_msg = traceback.format_exc()
+        print(f"\nERRO ao converter {src.name}: {e}\n")
+        return src, dst, False, error_msg, False
 
 def convert_all_to_mp4(input_videos: list[Path], output_dir: Path, n_jobs: int = 4):
     output_dir.mkdir(parents=True, exist_ok=True)
-
     tasks = []
-    mapping = []
-
     for vid in input_videos:
         base = slugify(vid.stem)
         dst = output_dir / f"{base}.mp4"
         tasks.append((vid, dst))
 
     print(f"\n🔧 Convertendo {len(tasks)} vídeos para MP4 usando {n_jobs} processos...\n")
-
     pbar = tqdm(total=len(tasks), desc="Convertendo", unit="vídeo", dynamic_ncols=True)
-
     converted_paths = []
 
     with ProcessPoolExecutor(max_workers=n_jobs) as ex:
         futures = {ex.submit(_convert_single, t): t for t in tasks}
-
         for fut in as_completed(futures):
             src, dst, ok, err, skipped = fut.result()
-
-            if ok:
+            if ok and not skipped:
                 converted_paths.append(dst)
-
-            mapping.append({
-                "original": str(src),
-                "converted": str(dst),
-                "success": ok,
-                "error": err,
-                "skipped": skipped
-            })
-
             pbar.update(1)
             pbar.set_postfix_str(src.name[:35])
 
-    pd.DataFrame(mapping).to_csv(output_dir / "conversao.csv", index=False)
     return converted_paths
 
-
 # =====================================================================
-# DURAÇÃO DE VÍDEO
+# DURAÇÃO E EXTRAÇÃO DE FRAMES
 # =====================================================================
 
 def get_duration(path: Path) -> float:
     try:
-        reader = imageio.get_reader(str(path))
-        meta = {}
-        try: meta = reader.get_meta_data()
-        except: pass
-
-        if "duration" in meta:
-            reader.close()
-            return float(meta["duration"])
-
-        fps = meta.get("fps", None)
-        nframes = meta.get("nframes", None)
-
-        if fps and nframes:
-            reader.close()
-            return nframes / fps
-
-        # fallback: contar frames
-        cnt = 0
-        for _ in reader:
-            cnt += 1
+        reader = imageio.get_reader(str(path), "ffmpeg")
+        meta = reader.get_meta_data()
         reader.close()
-        return cnt / (fps or 25)
-
+        return float(meta.get("duration", 0.0))
     except:
         return 0.0
 
+def extract_sampled_frames(video_path: Path, min_duration: float, frames_dir: Path):
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    reader = imageio.get_reader(str(video_path), "ffmpeg")
+    meta = reader.get_meta_data()
+    fps = meta.get("fps", 25)
+    
+    num_frames_to_sample = int(min_duration) 
+    frame_paths = []
 
-# =====================================================================
-# EXTRAÇÃO DE FRAMES
-# =====================================================================
+    for i in range(num_frames_to_sample):
+        sec = i * 1.0
+        idx = int(round(sec * fps))
 
-def extract_frame_at_second(path: Path, sec: float):
-    try:
-        reader = imageio.get_reader(str(path))
-        meta = {}
-        try: meta = reader.get_meta_data()
-        except: pass
+        try:
+            frame = reader.get_data(idx)
+            img = Image.fromarray(frame).convert("RGB")
+            frame_name = f"{video_path.stem}_frame_{i:04d}.png"
+            frame_path = frames_dir / frame_name
+            img.save(frame_path)
+            frame_paths.append(str(frame_path))
+        except IndexError:
+            break
+        except Exception:
+            break
 
-        fps = meta.get("fps", None)
-
-        if fps:
-            idx = int(round(sec * fps))
-            try:
-                frame = reader.get_data(idx)
-            except:
-                frame = reader.get_data(max(0, len(reader)-1))
-            reader.close()
-            return Image.fromarray(frame).convert("RGB")
-
-        # fallback
-        last = None
-        for f in reader:
-            last = f
-        reader.close()
-
-        if last is None:
-            return None
-
-        return Image.fromarray(last).convert("RGB")
-
-    except Exception:
-        return None
-
+    reader.close()
+    return frame_paths, num_frames_to_sample
 
 # =====================================================================
 # RUÍDOS
@@ -214,37 +155,27 @@ def extract_frame_at_second(path: Path, sec: float):
 def add_blur_sp(img, intensity):
     blur_radius = 1 + intensity * 6
     sp_amount  = intensity * 0.06
-
     blurred = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
     arr = np.array(blurred).astype(np.int16)
-
     h, w, c = arr.shape
     n = max(1, int(h*w*sp_amount))
-
     ys = np.random.randint(0, h, n)
     xs = np.random.randint(0, w, n)
     arr[ys, xs] = 255
-
     ys = np.random.randint(0, h, n)
     xs = np.random.randint(0, w, n)
     arr[ys, xs] = 0
-
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-
 
 def add_shapes(img, intensity):
     base = img.convert("RGBA")
     overlay = Image.new("RGBA", base.size)
     d = ImageDraw.Draw(overlay, "RGBA")
-
     w, h = base.size
     alpha = int(50 + intensity * 205)
-
     d.line((0,0,w,h), fill=(255,0,0,alpha), width=3)
     d.line((0,h,w,0), fill=(255,0,0,alpha), width=3)
-
     return Image.alpha_composite(base, overlay).convert("RGB")
-
 
 def add_gaussian(img, intensity):
     sigma = intensity * 60
@@ -253,206 +184,202 @@ def add_gaussian(img, intensity):
     arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
     return Image.fromarray(arr)
 
-
 def apply_noise(img, noise_type, intensity):
     if noise_type == "blur_sp": return add_blur_sp(img, intensity)
     if noise_type == "shapes_x": return add_shapes(img, intensity)
     if noise_type == "gaussian": return add_gaussian(img, intensity)
     raise ValueError(noise_type)
 
+# ================================================================
+# VISUALIZAÇÃO (simples) — adaptado para novos nomes de colunas
+# ================================================================
+def visualizar_exemplos_ruido(df: pd.DataFrame, original_col: str, modified_col: str, noise_type_col: str):
+    examples = []
+    # Usamos o set(NOISE_TYPES) para garantir que pegamos os 3 tipos definidos globalmente
+    for noise_type in set(NOISE_TYPES): 
+        df_noise = df[df[noise_type_col] == noise_type]
+        if not df_noise.empty:
+            row = df_noise.iloc[0]
+            # Usando .iloc[0] pegamos o primeiro exemplo que aparecer no DF
+            orig = Path(row[original_col])
+            mod = Path(row[modified_col]) if pd.notna(row[modified_col]) else None
+            if orig.exists() and (mod is None or mod.exists()):
+                examples.append((noise_type, orig, mod))
+
+    if not examples:
+        fig = plt.figure(figsize=(6, 3))
+        plt.text(0.5, 0.5, "Nenhum exemplo de ruído disponível", ha="center", va="center")
+        plt.axis("off")
+        return fig
+
+    n = len(examples)
+    fig, axes = plt.subplots(n, 2, figsize=(8, 4 * n))
+    if n == 1:
+        axes = [axes] # Garante que axes seja sempre 2D array-like
+
+    for i, (noise, orig, mod) in enumerate(examples):
+        ax_orig = axes[i][0]
+        ax_mod = axes[i][1]
+        ax_orig.imshow(Image.open(orig))
+        ax_orig.set_title(f"Original ({noise})")
+        ax_orig.axis("off")
+        if mod:
+            ax_mod.imshow(Image.open(mod))
+            ax_mod.set_title(f"Modificado ({noise})")
+        else:
+            ax_mod.text(0.5, 0.5, "Sem modificado", ha="center")
+        ax_mod.axis("off")
+
+    plt.tight_layout()
+    return fig
+
+
+def salvar_visualizacao(df: pd.DataFrame, nome_arquivo: str, original_col: str, modified_col: str, noise_type_col: str) -> Path:
+    fig = visualizar_exemplos_ruido(df, original_col, modified_col, noise_type_col)
+    try:
+        out_path = Path(__file__).resolve().parent / nome_arquivo
+    except Exception:
+        out_path = Path.cwd() / nome_arquivo
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"✔ Visualização salva em: {out_path}")
+    return out_path
 
 # =====================================================================
 # PIPELINE PRINCIPAL
 # =====================================================================
 
-def build_dataset(dataset_name="dataset_final", n_h1_repeats=5, n_jobs=4):
+def build_dataset(dataset_name="dataset_final", n_jobs=4):
 
     print("\n==============================")
     print("📦 MONTANDO DATASET FINAL")
     print("==============================\n")
 
+    for d in [FRAMES_ORIGINAIS_DIR, FRAMES_RUIDOS_H1_DIR, FRAMES_INTENSIDADES_H2_DIR, ORQUESTRADOR_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
     raw_videos = list_videos(RAW_DIR)
     print(f"📁 Vídeos encontrados (raw): {len(raw_videos)}")
 
-    # ------------------------------------------------------------
-    # 1) Converter para MP4
-    # ------------------------------------------------------------
-    converted = convert_all_to_mp4(raw_videos, WORK_DIR, n_jobs=n_jobs)
-    print(f"\n✔ Conversão para MP4 concluída: {len(converted)} vídeos\n")
+    converted_paths = convert_all_to_mp4(raw_videos, WORK_DIR, n_jobs=n_jobs)
+    if not converted_paths:
+        print(f"{Fore.RED}ERRO: 0 vídeos convertidos. Verifique as permissões ou a instalação do ffmpeg no PATH.{Style.RESET_ALL}")
+        return
 
-    # ------------------------------------------------------------
-    # 2) Durações
-    # ------------------------------------------------------------
-    df_meta = []
-    for p in converted:
-        df_meta.append({
-            "path": str(p),
-            "name": p.stem,
-            "duration": get_duration(p)
-        })
+    durations = [get_duration(p) for p in converted_paths]
+    min_duration = math.floor(min(durations)) if durations else 1
+    print(f"\n✔ Durações calculadas. Duração mínima (T): {min_duration} segundos.\n")
+    
+    print(f"🖼️ Extraindo frames originais (1/s por {min_duration}s)...")
+    all_original_frames_map = {}
+    for video_path in tqdm(converted_paths, desc="Extraindo Originais", dynamic_ncols=True):
+        frames, num_sampled = extract_sampled_frames(video_path, min_duration, FRAMES_ORIGINAIS_DIR)
+        all_original_frames_map[str(video_path.name)] = frames
+    
+    T = num_sampled
+    print(f"✔ Extração de frames originais concluída. T = {T} frames por vídeo.\n")
 
-    df_meta = pd.DataFrame(df_meta)
-    df_meta = df_meta.sort_values("duration").reset_index(drop=True)
+    # 4) Preparação H1: Ruído fixo por vídeo (aleatório)
+    print("💥 Gerando frames ruidosos para H1 (Tipo de ruído fixo por vídeo)...")
+    df_h1_orchestrator_rows = []
+    
+    video_names = list(all_original_frames_map.keys())
+    random.shuffle(video_names)
+    num_videos = len(video_names)
+    chunk_size = num_videos // len(NOISE_TYPES)
+    noise_assignment_h1 = {}
+    current_index = 0
 
-    T = max(1, int(df_meta["duration"].min()))
-    print(f"⏱ Usando T = {T} segundos (1 FPS)\n")
+    for noise_type in NOISE_TYPES:
+        for i in range(chunk_size):
+            if current_index < num_videos:
+                noise_assignment_h1[video_names[current_index]] = noise_type
+                current_index += 1
+    while current_index < num_videos:
+        noise_assignment_h1[video_names[current_index]] = random.choice(NOISE_TYPES)
+        current_index += 1
 
-    # ------------------------------------------------------------
-    # Criar pastas dataset/
-    # ------------------------------------------------------------
-    root = DATASET_DIR / dataset_name
-    orig_dir = root / "frames_originais"
-    h1_dir   = root / "frames_h1"
-    h2_dir   = root / "frames_h2"
-    exp_dir  = root / "orquestrador"
+    for video_name, original_frames in tqdm(all_original_frames_map.items(), desc="Aplicando Ruído H1", dynamic_ncols=True):
+        noise_type = noise_assignment_h1[video_name]
+        for frame_path_str in original_frames:
+            frame_path = Path(frame_path_str)
+            img = Image.open(frame_path)
+            noisy_img = apply_noise(img, noise_type, 1.0) 
+            noisy_frame_name = f"H1_{noise_type}_{frame_path.name}"
+            noisy_frame_path = FRAMES_RUIDOS_H1_DIR / noisy_frame_name
+            noisy_img.save(noisy_frame_path)
 
-    for p in [root, orig_dir, h1_dir, h2_dir, exp_dir]:
-        p.mkdir(parents=True, exist_ok=True)
+            df_h1_orchestrator_rows.append({
+                "video_name": video_name,
+                "frame_original_path": str(frame_path),
+                "frame_ruidoso_path_h1": str(noisy_frame_path),
+                "noise_type_h1": noise_type,
+                "noise_intensity_h1": 1.0,
+                "frame_index": frame_path.stem.split('_')[-1],
+                "experiment_type": "H1_H5"
+            })
+    
+    # 5) Preparação H2: Ruído com escala de intensidade temporal por vídeo (aleatório)
+    print("📉 Gerando frames ruidosos para H2 (Escala de intensidade temporal)...")
+    df_h2_orchestrator_rows = []
+    
+    if T > 1:
+        intensities = np.linspace(0.0, 1.0, T)
+    else:
+        intensities = [1.0]
+    
+    video_names_h2 = list(all_original_frames_map.keys())
+    random.shuffle(video_names_h2)
+    noise_assignment_h2 = {}
+    current_index = 0
+    for noise_type in NOISE_TYPES:
+        for i in range(chunk_size):
+            if current_index < num_videos:
+                noise_assignment_h2[video_names_h2[current_index]] = noise_type
+                current_index += 1
+    while current_index < num_videos:
+        noise_assignment_h2[video_names_h2[current_index]] = random.choice(NOISE_TYPES)
+        current_index += 1
 
-    # ------------------------------------------------------------
-    # 3) Extrair frames 1 FPS
-    # ------------------------------------------------------------
-    rows_orig = []
-    for idx, row in df_meta.iterrows():
-        vid = Path(row["path"])
-        name = row["name"]
+    for video_name, original_frames in tqdm(all_original_frames_map.items(), desc="Aplicando Ruído H2", dynamic_ncols=True):
+        noise_type = noise_assignment_h2[video_name]
+        for i, frame_path_str in enumerate(original_frames):
+            frame_path = Path(frame_path_str)
+            img = Image.open(frame_path)
+            intensity = intensities[i]
+            noisy_img = apply_noise(img, noise_type, intensity)
+            noisy_frame_name = f"H2_{noise_type}_int{int(intensity*100):03d}_{frame_path.name}"
+            noisy_frame_path = FRAMES_INTENSIDADES_H2_DIR / noisy_frame_name
+            noisy_img.save(noisy_frame_path)
 
-        for i in range(T):
-            img = extract_frame_at_second(vid, i)
-            if img is None:
-                continue
+            df_h2_orchestrator_rows.append({
+                "video_name": video_name,
+                "frame_original_path": str(frame_path),
+                "frame_intensidade_path_h2": str(noisy_frame_path),
+                "noise_type_h2": noise_type,
+                "noise_intensity_h2": intensity,
+                "frame_index": i,
+                "experiment_type": "H2"
+            })
 
-            fname = f"{name}_frame{i+1}.png"
-            out = orig_dir / fname
-            img.save(out)
+    # 6) Gerar CSVs Orquestradores e Visualizações
+    print("📊 Gerando arquivos CSVs e visualizações orquestradores...")
+    df_h1 = pd.DataFrame(df_h1_orchestrator_rows)
+    df_h2 = pd.DataFrame(df_h2_orchestrator_rows)
 
-            rec = {
-                "filename": fname,
-                "video_name": name,
-                "frame_number": i+1,
-                "oficial_path": str(out),
-                "duration": row["duration"]
-            }
-            for c in SCORE_COLUMNS:
-                rec[c] = np.nan
-            rows_orig.append(rec)
+    df_h1.to_csv(ORQUESTRADOR_DIR / "orquestrador_H1_H5.csv", index=False)
+    df_h2.to_csv(ORQUESTRADOR_DIR / "orquestrador_H2.csv", index=False)
+    
+    # Gerar visualizações H1 e H2
+    salvar_visualizacao(df_h1, "visualizacao_H1_H5.png", "frame_original_path", "frame_ruidoso_path_h1", "noise_type_h1")
+    salvar_visualizacao(df_h2, "visualizacao_H2.png", "frame_original_path", "frame_intensidade_path_h2", "noise_type_h2")
 
-    df_orig = pd.DataFrame(rows_orig)
-    df_orig.to_csv(root / "frames_originais.csv", index=False)
-    print(f"✔ Frames originais: {len(df_orig)}\n")
-
-    # ------------------------------------------------------------
-    # ASSIGN NOISE TYPES
-    # ------------------------------------------------------------
-    vids = df_orig["video_name"].unique().tolist()
-    random.shuffle(vids)
-
-    assignment = {}
-    group = len(vids)//len(NOISE_TYPES)
-
-    start = 0
-    for i, nt in enumerate(NOISE_TYPES):
-        if i < len(NOISE_TYPES)-1:
-            chunk = vids[start:start+group]
-        else:
-            chunk = vids[start:]
-        for v in chunk:
-            assignment[v] = nt
-        start += group
-
-    # ------------------------------------------------------------
-    # 4) H1 — intensidade 1.0 constante
-    # ------------------------------------------------------------
-    h1_rows = []
-    for v in vids:
-        nt = assignment[v]
-        dfv = df_orig[df_orig["video_name"] == v]
-
-        sub = h1_dir / nt
-        sub.mkdir(exist_ok=True)
-
-        for _, r in dfv.iterrows():
-            orig = Image.open(r["oficial_path"]).convert("RGB")
-            mod  = apply_noise(orig, nt, 1.0)
-
-            fname = r["filename"].replace(".png", f"_h1_{nt}.png")
-            out = sub / fname
-            mod.save(out)
-
-            rec = {
-                "filename_orig": r["filename"],
-                "filename_mod": fname,
-                "video_name": v,
-                "frame_number": r["frame_number"],
-                "noise_type": nt,
-                "noise_intensity": 1.0,
-                "oficial_path_orig": r["oficial_path"],
-                "oficial_path_mod": str(out)
-            }
-
-            for c in SCORE_COLUMNS:
-                rec[c] = np.nan
-
-            h1_rows.append(rec)
-
-    df_h1 = pd.DataFrame(h1_rows)
-    df_h1.to_csv(exp_dir / "h1_mapping.csv", index=False)
-    print(f"✔ H1 gerado: {len(df_h1)}\n")
-
-    # ------------------------------------------------------------
-    # 5) H2 — rampa 0→1
-    # ------------------------------------------------------------
-    h2_rows = []
-    for v in vids:
-        nt = assignment[v]
-        dfv = df_orig[df_orig["video_name"] == v].sort_values("frame_number")
-
-        ramp = np.linspace(0,1,len(dfv))
-
-        sub = h2_dir / v
-        sub.mkdir(exist_ok=True)
-
-        for idx,(i,r) in enumerate(dfv.iterrows()):
-            orig = Image.open(r["oficial_path"]).convert("RGB")
-            inten = float(ramp[idx])
-            mod  = apply_noise(orig, nt, inten)
-
-            pct = int(round(inten*100))
-            fname = r["filename"].replace(".png", f"_h2_{nt}_i{pct}.png")
-            out = sub / fname
-            mod.save(out)
-
-            rec = {
-                "filename_orig": r["filename"],
-                "filename_mod": fname,
-                "video_name": v,
-                "frame_number": r["frame_number"],
-                "noise_type": nt,
-                "noise_intensity": inten,
-                "oficial_path_orig": r["oficial_path"],
-                "oficial_path_mod": str(out)
-            }
-            for c in SCORE_COLUMNS:
-                rec[c] = np.nan
-
-            h2_rows.append(rec)
-
-    df_h2 = pd.DataFrame(h2_rows)
-    df_h2.to_csv(exp_dir / "h2_mapping.csv", index=False)
-    print(f"✔ H2 gerado: {len(df_h2)}\n")
-
-    print("\n🎉 Dataset final construído com sucesso!")
-    return {
-        "root": root,
-        "orig_csv": root/"frames_originais.csv",
-        "h1_csv": exp_dir/"h1_mapping.csv",
-        "h2_csv": exp_dir/"h2_mapping.csv"
-    }
+    print("✨ Pipeline de preparação de dataset concluída.")
 
 
 # =====================================================================
-# MAIN
+# PONTO DE ENTRADA (MAIN)
 # =====================================================================
 
 if __name__ == "__main__":
-    build_dataset(dataset_name="auto_dataset_final", n_jobs=6)
+    build_dataset(n_jobs=4)
