@@ -1,4 +1,9 @@
+Auxiliar/
 dataset/
 gif_storyboarding/
 gifs/
+resultados/
 *.zip
+*.png
+*.jpg
+paths_baixados.txt
