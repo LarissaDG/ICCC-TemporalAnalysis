@@ -1,6 +1,11 @@
+# score_temporal_dataset.py
+# -*- coding: utf-8 -*-
+
 import os
 import sys
 from pathlib import Path
+
+# Caminho do APDDv2 (ajuste se necessário)
 sys.path.append('/home_cerberus/disk3/larissa.gomide/APDDv2/')
 
 import torch
@@ -20,7 +25,7 @@ import pandas as pd
 #   CLI
 # =======================================================
 def init():
-    parser = argparse.ArgumentParser(description="PyTorch Aesthetic Scoring")
+    parser = argparse.ArgumentParser(description="APDDv2 Scoring de Frames")
 
     parser.add_argument(
         "--single",
@@ -28,15 +33,21 @@ def init():
         help="Se ativo, processa apenas a primeira linha do CSV"
     )
 
-    args = parser.parse_args()
-    return args
+    parser.add_argument(
+        "--dataset_root",
+        type=str,
+        required=True,
+        help="Root do dataset temporal (ex: dataset/auto_dataset)"
+    )
+
+    return parser.parse_args()
 
 
 opt = init()
 
 
 # =======================================================
-#   Funções de apoio
+#   Funções APDDv2
 # =======================================================
 def get_score(opt, y_pred):
     score_np = y_pred.data.cpu().numpy()
@@ -50,10 +61,10 @@ def load_model(weight_path, device):
         model.load_state_dict(torch.load(weight_path))
         model.to(device)
         model.eval()
-        print(f"Modelo carregado com sucesso: {weight_path}")
+        print(f"✔ Modelo OK: {weight_path}")
         return model
     except Exception as e:
-        print(f"Falha ao carregar modelo de {weight_path}: {e}")
+        print(f"❌ Falha ao carregar modelo {weight_path}: {e}")
         return None
 
 
@@ -67,7 +78,7 @@ def evaluate_image(image_path, models_dict, preprocess, opt, device):
     try:
         image_input = preprocess(image).unsqueeze(0).to(device)
     except Exception as e:
-        print(f"Erro ao preprocessar imagem {image_path}: {e}")
+        print(f"Erro no preprocess {image_path}: {e}")
         return {col: np.nan for col in models_dict.keys()}
 
     scores = {}
@@ -78,14 +89,15 @@ def evaluate_image(image_path, models_dict, preprocess, opt, device):
                 _, pred_val = get_score(opt, pred)
 
                 if isinstance(pred_val, np.ndarray) and pred_val.size == 1:
-                    pred_val = pred_val.item()
+                    pred_val = float(pred_val.item())
 
+                # "Total aesthetic score" é reescalado ×10
                 if col == "Total aesthetic score":
-                    pred_val = pred_val * 10
+                    pred_val *= 10
 
                 scores[col] = pred_val
             except Exception as e:
-                print(f"Erro ao prever {col} para imagem {image_path}: {e}")
+                print(f"Erro ao prever {col} para {image_path}: {e}")
                 scores[col] = np.nan
         else:
             scores[col] = np.nan
@@ -94,141 +106,112 @@ def evaluate_image(image_path, models_dict, preprocess, opt, device):
 
 
 # =======================================================
-#   PROCESSAMENTO DO CSV
+#   PROCESSAR CSV ÚNICO
 # =======================================================
-def process_csv(base_dir, input_csv, output_csv, models_dict, preprocess, opt, device, cols_to_compare):
+def process_csv(input_csv, output_csv, dataset_root, models_dict, preprocess, opt, device, cols):
 
-    print(f"\n📄 Lendo CSV: {input_csv}")
+    print(f"\n📄 Lendo: {input_csv}")
 
     try:
-        df = pd.read_csv(input_csv, encoding="utf-8")
+        df = pd.read_csv(input_csv)
     except Exception:
         df = pd.read_csv(input_csv, encoding="latin1")
 
     if opt.single:
-        print("⚠️ Rodando SOMENTE a primeira linha (--single)")
         df = df.iloc[[0]].copy()
 
     for idx, row in df.iterrows():
-        image_path = os.path.join("dataset", row.get("oficial_path"))
 
-        if not image_path or not os.path.exists(image_path):
-            print(f"⚠️ Imagem NÃO encontrada na linha {idx}: {image_path}")
-            for col in cols_to_compare:
-                df.loc[idx, col] = np.nan
+        # Coluna padrão usada pelo seu pipeline
+        img_path = row.get("oficial_path")
+
+        if not isinstance(img_path, str):
+            print(f"⚠️ Linha {idx} sem path")
+            for c in cols:
+                df.loc[idx, c] = np.nan
             continue
 
-        scores = evaluate_image(image_path, models_dict, preprocess, opt, device)
-        for col in cols_to_compare:
-            df.loc[idx, col] = scores.get(col, np.nan)
+        full_path = Path(dataset_root) / img_path
 
-        print(f"✔ Linha {idx} processada")
+        if not full_path.exists():
+            print(f"❌ Imagem não encontrada: {full_path}")
+            for c in cols:
+                df.loc[idx, c] = np.nan
+            continue
+
+        scores = evaluate_image(full_path, models_dict, preprocess, opt, device)
+
+        for c in cols:
+            df.loc[idx, c] = scores.get(c, np.nan)
+
+        print(f"✔ Frame {idx} scored")
 
     df.to_csv(output_csv, index=False)
-    print(f"💾 Arquivo salvo em: {output_csv}")
+    print(f"💾 Salvo: {output_csv}")
 
 
 # =======================================================
-#   MAIN
+#   MAIN (PROCESSA OS 3 CSVs DO PIPELINE TEMPORAL)
 # =======================================================
 def main():
 
-    # ---------------------------------------------------
-    #  GPU
-    # ---------------------------------------------------
+    # 1) GPU
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     _, preprocess = clip.load('ViT-B/16', device)
 
-    # ---------------------------------------------------
-    #  Carregar modelos
-    # ---------------------------------------------------
-    score_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/1.Score_reg_weight--e4-train0.4393-test0.6835_best.pth", device)
-    theme_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/2.Theme and logic_reg_weight--e5-train0.3792-test0.5953_best.pth", device)
-    creativity_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/3.Creativity_reg_weight--e5-train0.4212-test0.7122_best.pth", device)
-    layout_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/4.Layout and composition_reg_weight--e6-train0.2783-test0.6342_best.pth", device)
-    space_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/5.Space and perspective_reg_weight--e7-train0.2168-test0.5998_best.pth", device)
-    sense_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/Model_6.pth", device)
-    light_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/7.Light and shadow_reg_weight--e7-train0.1937-test0.6518_best.pth", device)
-    color_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/8.Color_reg_weight--e5-train0.2905-test0.5871_best.pth", device)
-    details_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/9.Details and texture_reg_weight--e4-train0.4385-test0.7034_best.pth", device)
-    overall_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/10.The overall_reg_weight--e3-train0.5131-test0.6343_best.pth", device)
-    mood_model = load_model("/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/11.Mood_reg_weight--e7-train0.3108-test0.7097_best.pth", device)
-
-    cols_to_compare = [
-        "Total aesthetic score", "Theme and logic", "Creativity", "Layout and composition",
-        "Space and perspective", "The sense of order", "Light and shadow", "Color",
-        "Details and texture", "The overall", "Mood"
-    ]
-
-    models_dict = {
-        "Total aesthetic score": score_model,
-        "Theme and logic": theme_model,
-        "Creativity": creativity_model,
-        "Layout and composition": layout_model,
-        "Space and perspective": space_model,
-        "The sense of order": sense_model,
-        "Light and shadow": light_model,
-        "Color": color_model,
-        "Details and texture": details_model,
-        "The overall": overall_model,
-        "Mood": mood_model
+    # 2) Carregar modelos APDDv2
+    model_paths = {
+        "Total aesthetic score": "1.Score_reg_weight--e4-train0.4393-test0.6835_best.pth",
+        "Theme and logic": "2.Theme and logic_reg_weight--e5-train0.3792-test0.5953_best.pth",
+        "Creativity": "3.Creativity_reg_weight--e5-train0.4212-test0.7122_best.pth",
+        "Layout and composition": "4.Layout and composition_reg_weight--e6-train0.2783-test0.6342_best.pth",
+        "Space and perspective": "5.Space and perspective_reg_weight--e7-train0.2168-test0.5998_best.pth",
+        "The sense of order": "Model_6.pth",
+        "Light and shadow": "7.Light and shadow_reg_weight--e7-train0.1937-test0.6518_best.pth",
+        "Color": "8.Color_reg_weight--e5-train0.2905-test0.5871_best.pth",
+        "Details and texture": "9.Details and texture_reg_weight--e4-train0.4385-test0.7034_best.pth",
+        "The overall": "10.The overall_reg_weight--e3-train0.5131-test0.6343_best.pth",
+        "Mood": "11.Mood_reg_weight--e7-train0.3108-test0.7097_best.pth"
     }
 
-    # ---------------------------------------------------
-    #  Diretório base com as duas pastas
-    # ---------------------------------------------------
-    base_dir = Path("/sonic_home/larissa.gomide/dataset")
+    base_w = "/home_cerberus/disk3/larissa.gomide/APDDv2/modle_weights/"
+    models_dict = {k: load_model(base_w + v, device) for k, v in model_paths.items()}
 
-    folders = ["gif_storyboarding", "gifs"]
+    cols = list(models_dict.keys())
 
-    for folder in folders:
-        folder_path = base_dir / "dataset" / folder
+    # 3) CSVs do dataset temporal
+    root = Path(opt.dataset_root)
 
-        print(f"\n📁 Processando pasta: {folder_path}")
+    csvs = {
+        "orig": root / "auto_dataset_original_frames_scored.csv",
+        "h1": root / "orquestrador_experimentos" / "h1_ruidos_mapping_scored.csv",
+        "h2": root / "orquestrador_experimentos" / "h2_intensity_mapping_scored.csv"
+    }
 
-        # ============================================================
-        #   FILTRO: só pegar *_dataset.csv e ignorar tudo com _scored
-        # ============================================================
-        csv_files = []
-        for f in folder_path.glob("*_dataset*.csv"):
-            name = f.name
+    inputs = {
+        "orig": root / "auto_dataset_original_frames.csv",
+        "h1": root / "orquestrador_experimentos" / "h1_ruidos_mapping.csv",
+        "h2": root / "orquestrador_experimentos" / "h2_intensity_mapping.csv"
+    }
 
-            # Ignorar CSVs com mais de um _scored
-            if name.count("_scored") > 1:
-                continue
+    # 4) Processar os 3 CSVs
+    for key in ["orig", "h1", "h2"]:
+        print("\n===================================================")
+        print(f"PROCESSANDO → {key.upper()}")
+        print("===================================================")
 
-            # Ignorar arquivos que JÁ são scored
-            if name.endswith("_scored.csv"):
-                continue
+        process_csv(
+            input_csv=inputs[key],
+            output_csv=csvs[key],
+            dataset_root=root,
+            models_dict=models_dict,
+            preprocess=preprocess,
+            opt=opt,
+            device=device,
+            cols=cols
+        )
 
-            # Aceitar apenas o original: *_dataset.csv
-            if name.endswith("_dataset.csv"):
-                csv_files.append(f)
-
-        csv_files = sorted(csv_files)
-
-        if not csv_files:
-            print(f"⚠️ Nenhum CSV ORIGINAL encontrado em: {folder_path}")
-            continue
-
-        for csv_in in csv_files:
-            csv_out = folder_path / (csv_in.stem + "_scored.csv")
-
-            print(f"\n➡️ Entrada: {csv_in}")
-            print(f"⬅️ Saída : {csv_out}")
-
-            process_csv(
-                base_dir,
-                str(csv_in),
-                str(csv_out),
-                models_dict,
-                preprocess,
-                opt,
-                device,
-                cols_to_compare
-            )
-
-    print("\n✔ TODOS OS CSVs foram processados com sucesso!")
+    print("\n🎉 FINALIZADO — Todos os frames foram avaliados APDDv2!\n")
 
 
 if __name__ == "__main__":
