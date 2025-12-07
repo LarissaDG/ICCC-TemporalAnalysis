@@ -181,159 +181,6 @@ def add_gaussian_noise(frame, intensity=100):
     return Image.fromarray(noisy), sigma
 
 # =====================================================
-# PATINHAS
-# =====================================================
-def generate_realistic_paw(size=110, color=(90, 60, 40), alpha=200):
-    w = h = size
-    img = Image.new("RGBA", (w, h), (0,0,0,0))
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    # -------------------------
-    # Almofadinhas (4 dígitos)
-    # -------------------------
-    toe = int(size * 0.22)
-    offset_x = size * 0.05
-    top_y = size * 0.08
-
-    digits = [
-        (w/2 - toe/2, top_y),                      # Superior central
-        (w/2 - toe - offset_x, top_y + toe*0.6),   # Esquerda
-        (w/2 + offset_x, top_y + toe*0.6),         # Direita
-        (w/2 - toe/2, top_y + toe*1.3),            # Inferior
-    ]
-
-    for (x, y) in digits:
-        draw.ellipse([x, y, x+toe, y+toe], fill=color + (alpha,))
-
-    # ----------------------------------------------
-    # Almofada principal tipo “nuvem”
-    # 3 círculos + retângulo arredondado
-    # ----------------------------------------------
-    base_h = int(size * 0.33)
-    base_w = int(size * 0.65)
-    base_x = (w - base_w) / 2
-    base_y = int(size * 0.45)
-
-    # Parte retangular arredondada
-    draw.rounded_rectangle(
-        [base_x, base_y, base_x+base_w, base_y+base_h],
-        radius=int(base_h*0.6),
-        fill=color + (alpha,)
-    )
-
-    # 3 círculos superiores da nuvem
-    bubble_r = int(size * 0.20)
-    bubbles = [
-        (base_x + bubble_r*0.2, base_y - bubble_r*0.2),
-        (base_x + base_w/2 - bubble_r/2, base_y - bubble_r*0.35),
-        (base_x + base_w - bubble_r*1.2, base_y - bubble_r*0.2)
-    ]
-
-    for (bx, by) in bubbles:
-        draw.ellipse([bx, by, bx+bubble_r, by+bubble_r],
-                     fill=color + (alpha,))
-
-    return img
-
-def perlin_curve_path(W, H, steps, mode="organic"):
-    """ Gera uma sequência de coordenadas orgânicas """
-
-    pts = []
-    for i in range(steps):
-        t = i / (steps - 1)
-
-        if mode == "zigzag":
-            x = int(W * (0.1 + t*0.8))
-            y = int(H*0.5 + 120*math.sin(6*t) + 30*math.sin(13*t))
-
-        elif mode == "circular":
-            angle = 2*math.pi*t
-            radius = min(W,H)*0.25
-            x = int(W/2 + radius * math.cos(angle))
-            y = int(H/2 + radius * math.sin(angle))
-
-        else:  # ORGANIC DEFAULT (Perlin-like)
-            x = int(W * (0.05 + t*0.9))
-            y = int(H*0.5 +
-                    80*math.sin(4*t) +
-                    40*math.sin(9*t) +
-                    20*math.sin(17*t))
-
-        pts.append((x, y))
-
-    return pts
-
-def generate_paw(size):
-    paw = generate_procedural_paw(size=size)
-    if random.random() < 0.8:
-        paw = paw.filter(ImageFilter.GaussianBlur(1.5))
-    return paw
-
-def add_paws(frame, steps=14, paw_size=110,
-                       path_type="organic", jitter=25):
-
-    frame = frame.convert("RGBA")
-    W, H = frame.size
-
-    color = sample_color_from_image(frame, n_samples=30)
-    paw = generate_realistic_paw(size=paw_size, color=color)
-
-    path = perlin_curve_path(W, H, steps, mode=path_type)
-
-    for i, (x, y) in enumerate(path):
-
-        # Alternância direita/esquerda
-        is_right = (i % 2 == 0)
-        side = 1 if is_right else -1
-
-        offset_y = -40 if (i % 4 < 2) else 40   # frente/trás
-
-        jx = random.randint(-jitter, jitter)
-        jy = random.randint(-jitter, jitter)
-
-        px = int(x + side * paw_size*0.45 + jx)
-        py = int(y + offset_y + jy)
-
-        p = paw.rotate(random.randint(-25,25), expand=True)
-        frame.alpha_composite(p, (px, py))
-
-    return frame.convert("RGB")
-
-
-# =====================================================
-# ANIMAÇÃO: GIF DE PATINHAS
-# =====================================================
-def generate_paw_walk_gif(img, steps=14, save_path="patinhas_walk.gif"):
-    frames = []
-    W, H = img.size
-
-    # Caminho único para manter continuidade
-    path = perlin_curve_path(W, H, steps, mode="organic")
-    color = sample_color_from_image(img)
-    paw = generate_realistic_paw(110, color=color)
-
-    current = img.convert("RGBA")
-
-    for i, (x,y) in enumerate(path):
-        is_right = (i % 2 == 0)
-        side = 1 if is_right else -1
-        offset = -40 if (i % 4 < 2) else 40
-
-        jx = random.randint(-20,20)
-        jy = random.randint(-20,20)
-
-        p = paw.rotate(random.randint(-25,25), expand=True)
-        px = int(x + side*50 + jx)
-        py = int(y + offset + jy)
-
-        current.alpha_composite(p, (px, py))
-        frames.append(current.copy())
-
-    imageio.mimsave(save_path, frames, duration=0.25)
-
-
-
-# =====================================================
 # GERAR N INTENSIDADES DIFERENTES DE CADA RUÍDO
 # =====================================================
 def generate_noise_sweep(img, n=5, out_dir="ruido_tuning_sweep"):
@@ -403,21 +250,15 @@ def run_lab(img_path):
     r1, _, _ = add_blur_saltpepper(img)
     r2, _ = add_shapes_x(img)
     r3, _ = add_gaussian_noise(img)
-    r4 = add_paws(img)
 
     r1.save(out_dir / "blur_saltpepper.png")
     r2.save(out_dir / "shapes_x.png")
     r3.save(out_dir / "gaussian.png")
-    r4.save(out_dir / "patinhas.png")
     img.save(out_dir / "original.png")
 
-    # GERAR GIF 🔥
-    gif_path = out_dir / "patinhas_walk.gif"
-    generate_paw_walk_gif(img, steps=12, save_path=gif_path)
-
     # Painel
-    titles = ["Original", "Blur+S&P", "Shapes/X", "Gaussian", "Patinhas"]
-    images = [img, r1, r2, r3, r4]
+    titles = ["Original", "Blur+S&P", "Shapes/X", "Gaussian"]
+    images = [img, r1, r2, r3]
 
     plt.figure(figsize=(18, 6))
     for i, (title, im) in enumerate(zip(titles, images)):
