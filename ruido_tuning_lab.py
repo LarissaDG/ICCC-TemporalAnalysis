@@ -171,6 +171,7 @@ def add_shapes_x(frame, intensity=100):
 def add_gaussian_noise(frame, intensity=100):
     #regra de três intensity
     sigma = 1000*intensity/100
+
     #varia de 0 a 1000
     rgb = frame.convert("RGB")
     arr = np.array(rgb).astype(np.int16)
