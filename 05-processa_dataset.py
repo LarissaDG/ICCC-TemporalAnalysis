@@ -1,259 +1,204 @@
 # -*- coding: utf-8 -*-
 
 import os
-import random
-import numpy as np
-import pandas as pd
-from pathlib import Path
-from PIL import Image, ImageFilter, ImageDraw
+import csv
 import imageio
-from tqdm import tqdm
-from multiprocessing import Pool, cpu_count
+import numpy as np
+from pathlib import Path
 
 # ============================================================
-#   CONFIGURAÇÕES GERAIS
+# BASE PATH — AJUSTE AQUI
 # ============================================================
 
-FRAMES_DIR = Path("frames_originais")
-VIDEOS_DIR = Path("videos_amostrados_mp4")
+# Exemplo:
+# PATH_BASE = Path("/mnt/data/projeto/")
+PATH_BASE = Path(".").resolve()   # default: diretório atual
 
-OUT_DIR_H0 = Path("frames_h0")
-OUT_DIR_H1 = Path("frames_h1")
-OUT_DIR_H2 = Path("frames_h2")
-
-for d in [OUT_DIR_H0, OUT_DIR_H1, OUT_DIR_H2]:
-    os.makedirs(d, exist_ok=True)
+print(f"[DEBUG] PATH_BASE = {PATH_BASE}")
 
 # ============================================================
-#   RUÍDOS
+# CONFIGURAÇÕES DE SUBPASTAS (RELATIVAS AO PATH_BASE)
 # ============================================================
 
-def add_blur_sp(img, level):
-    if level <= 0:
-        return img
+VIDEOS_DIR = PATH_BASE / "videos"
+FRAMES_OUT = PATH_BASE / "videos_amostrados_mp4"
+NOISE_OUT = PATH_BASE / "videos_ruido"
 
-    img = img.copy().filter(ImageFilter.GaussianBlur(radius=level))
+FRAMES_OUT.mkdir(exist_ok=True, parents=True)
+NOISE_OUT.mkdir(exist_ok=True, parents=True)
 
-    arr = np.array(img)
-    s_vs_p = 0.5
-    amount = min(0.05 * level, 1.0)
+CSV_FRAMES = PATH_BASE / "amostragem_frames.csv"
+CSV_NOISE = PATH_BASE / "noise_sweep_map.csv"
+CSV_VIDEOS = PATH_BASE / "videos_info.csv"
 
-    num_salt = int(np.ceil(amount * arr.size * s_vs_p))
-    num_pepper = int(np.ceil(amount * arr.size * (1 - s_vs_p)))
+NOISE_LEVELS = [0.1, 0.2, 0.3]
 
-    coords = [np.random.randint(0, i - 1, num_salt) for i in arr.shape]
-    arr[coords[0], coords[1], :] = 255
-
-    coords = [np.random.randint(0, i - 1, num_pepper) for i in arr.shape]
-    arr[coords[0], coords[1], :] = 0
-
-    return Image.fromarray(arr)
-
-
-def add_shapes_x(img, intensity, video_name):
-    """
-    shapes_x com CACHE por vídeo.
-    (Mas o cache deve ser reiniciado fora daqui!)
-    """
-    global SHAPES_CACHE
-    if video_name not in SHAPES_CACHE:
-        SHAPES_CACHE[video_name] = []
-        np.random.seed(int(video_name) % 999_999)
-
-        base_shapes = []
-        for _ in range(3):
-            x1, y1 = np.random.randint(0, img.width), np.random.randint(0, img.height)
-            x2, y2 = np.random.randint(0, img.width), np.random.randint(0, img.height)
-            thick = np.random.randint(1, 5)
-            base_shapes.append((x1, y1, x2, y2, thick))
-
-        SHAPES_CACHE[video_name] = base_shapes
-
-    base = SHAPES_CACHE[video_name]
-    out = img.copy()
-    draw = ImageDraw.Draw(out)
-
-    k = min(max(int(intensity), 0), len(base))
-    for (x1, y1, x2, y2, thick) in base[:k]:
-        draw.line((x1, y1, x2, y2), fill="white", width=thick)
-
-    return out
-
-
-def add_gaussian_noise(img, level):
-    if level <= 0:
-        return img
-
-    arr = np.array(img).astype(np.float32)
-    noise = np.random.normal(0, level * 5, arr.shape)
-    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-    return Image.fromarray(arr)
-
-
-def generate_noise_sweep_single(img, noise_type, intensity, video_name):
-    if noise_type == "blur_sp":
-        return add_blur_sp(img, intensity)
-    elif noise_type == "shapes_x":
-        return add_shapes_x(img, intensity, video_name)
-    elif noise_type == "gaussian":
-        return add_gaussian_noise(img, intensity)
-    return img
+print(f"[DEBUG] VIDEOS_DIR = {VIDEOS_DIR}")
+print(f"[DEBUG] FRAMES_OUT = {FRAMES_OUT}")
+print(f"[DEBUG] NOISE_OUT = {NOISE_OUT}")
 
 
 # ============================================================
-#   LEITURA DE FRAMES
+# FUNÇÃO: extrair 1 frame por segundo
 # ============================================================
 
-def load_frames():
-    frames = []
-    for f in sorted(FRAMES_DIR.glob("*_frame_*.png")):
-        stem = f.stem
-        video_name, _, idx = stem.split("_")
-        frame_index = int(idx.lstrip("0") or "0")
+def extract_frames_uniform(video_path, out_dir):
+    print(f"[DEBUG] Lendo vídeo: {video_path}")
 
-        frames.append({
-            "video_name": video_name,
-            "frame_path": f,
-            "frame_index": frame_index
-        })
-    return frames
+    video_id = video_path.stem
+    reader = imageio.get_reader(str(video_path))
 
-
-# ============================================================
-#   ROUND-ROBIN PARA ATRIBUIR RUÍDOS
-# ============================================================
-
-def assign_noise_types(videos):
-    noise_types = ["blur_sp", "shapes_x", "gaussian"]
-    mapping = {}
-    for i, v in enumerate(sorted(videos)):
-        mapping[v] = noise_types[i % 3]
-    return mapping
-
-
-# ============================================================
-#   METADADOS DO VÍDEO
-# ============================================================
-
-def read_video_metadata(video_name):
-    path = VIDEOS_DIR / f"{video_name}.mp4"
-    reader = imageio.get_reader(str(path))
     meta = reader.get_meta_data()
+    fps = meta["fps"]
+    n_frames = meta["nframes"]
+    duration = n_frames / fps
 
-    duration = meta.get("duration", None)
-    nframes = meta.get("nframes", None)
+    print(f"[DEBUG] FPS={fps}, total_frames={n_frames}, duracao={duration:.2f}s")
 
-    try:
-        reader.close()
-    except:
-        pass
+    frames_info = []
 
-    return duration, nframes
+    # frame indices de 0 até n-1
+    frame_indices = np.arange(0, int(duration), 1)
+    frame_indices = (frame_indices * fps).astype(int)
+    frame_indices = np.clip(frame_indices, 0, n_frames - 1)
 
+    print(f"[DEBUG] Frames que serão extraídos: {frame_indices}")
 
-# ============================================================
-#   FUNÇÃO PROCESSAR UM ÚNICO FRAME (para multiprocessamento)
-# ============================================================
+    for frame_idx in frame_indices:
+        frame = reader.get_data(frame_idx)
 
-def process_single_frame(args):
-    (
-        fr,                   # dict do frame
-        noise_type,           # tipo de ruído
-        intensity_h2,         # intensidade progressiva
-        duration,             # duração do vídeo
-        nframes_video         # nº de frames do vídeo
-    ) = args
+        out_name = f"{video_id}_frame_{frame_idx:04d}.png"
+        out_path = out_dir / out_name
 
-    # cada processo precisa de IMG recarregada
-    img = Image.open(fr["frame_path"])
-    video_name = fr["video_name"]
+        imageio.imwrite(out_path, frame)
 
-    # H0
-    out_h0 = OUT_DIR_H0 / fr["frame_path"].name
-    img.save(out_h0)
+        print(f"[DEBUG] Frame salvo: {out_path}")
 
-    # H1 (intensidade fixa 6)
-    out_h1 = OUT_DIR_H1 / fr["frame_path"].name
-    img_h1 = generate_noise_sweep_single(img, noise_type, 6, video_name)
-    img_h1.save(out_h1)
+        frames_info.append({
+            "video_id": video_id,
+            "frame_index": int(frame_idx),
+            "frame_path": str(out_path.relative_to(PATH_BASE))
+        })
 
-    # H2 (crescente)
-    out_h2 = OUT_DIR_H2 / fr["frame_path"].name
-    img_h2 = generate_noise_sweep_single(img, noise_type, intensity_h2, video_name)
-    img_h2.save(out_h2)
+    reader.close()
 
-    return {
-        "video_name": fr["video_name"],
-        "frame_index": fr["frame_index"],
-        "original_frame": str(fr["frame_path"]),
-        "h0_path": str(out_h0),
-        "h1_path": str(out_h1),
-        "h2_path": str(out_h2),
-        "noise_type": noise_type,
-        "intensity_h1": 6,
-        "intensity_h2": intensity_h2,
-        "video_duration": duration,
-        "video_nframes": nframes_video
-    }
+    return frames_info, fps, n_frames, duration
 
 
 # ============================================================
-#   PROCESSAMENTO TOTAL (com multiprocessamento)
+# FUNÇÃO: gerar 1 imagem ruidosa por intensidade
 # ============================================================
 
-def process_all():
-    global SHAPES_CACHE
-    SHAPES_CACHE = {}
-
-    frames = load_frames()
-    videos = sorted({f["video_name"] for f in frames})
-    noise_assignment = assign_noise_types(videos)
-
-    rows = []
-
-    pool = Pool(cpu_count())
-
-    for v in tqdm(videos, desc="Processando vídeos", ncols=100):
-        # resetar shapes_x cache para este vídeo
-        if v in SHAPES_CACHE:
-            SHAPES_CACHE.pop(v)
-
-        duration, nframes_video = read_video_metadata(v)
-
-        video_frames = sorted(
-            [f for f in frames if f["video_name"] == v],
-            key=lambda x: x["frame_index"]
-        )
-
-        N = len(video_frames)
-        intensities = np.linspace(0, 10, N)
-
-        args = [
-            (
-                fr,
-                noise_assignment[v],
-                float(intensities[i]),
-                duration,
-                nframes_video
-            )
-            for i, fr in enumerate(video_frames)
-        ]
-
-        results = pool.map(process_single_frame, args)
-        rows.extend(results)
-
-    pool.close()
-    pool.join()
-
-    df = pd.DataFrame(rows)
-    df.to_csv("metadata_final.csv", index=False, encoding="utf-8")
-
-    print("\n✔ Finalizado! CSV salvo como metadata_final.csv")
+def generate_noise_sweep(img_array, intensity):
+    noise = np.random.normal(0, intensity * 255, img_array.shape)
+    noisy_img = img_array.astype(np.float32) + noise
+    noisy_img = np.clip(noisy_img, 0, 255).astype(np.uint8)
+    return noisy_img
 
 
 # ============================================================
-#   MAIN
+# PIPELINE PRINCIPAL
+# ============================================================
+
+def process_all_videos():
+
+    print("[DEBUG] Procurando vídeos em:", VIDEOS_DIR)
+    videos = sorted(VIDEOS_DIR.glob("*.mp4"))
+
+    print(f"[DEBUG] Vídeos encontrados ({len(videos)}):")
+    for v in videos:
+        print("   -", v)
+
+    if not videos:
+        print("ERRO: Nenhum vídeo encontrado.")
+        return
+
+    all_frames = []
+    all_noise = []
+    all_video_info = []
+
+    for i, video_path in enumerate(videos):
+        print(f"\n==============================")
+        print(f"[DEBUG] ({i+1}/{len(videos)}) Processando: {video_path.name}")
+        print("==============================")
+
+        frames_info, fps, n_frames, duration = extract_frames_uniform(video_path, FRAMES_OUT)
+
+        all_frames.extend(frames_info)
+        all_video_info.append({
+            "video_id": video_path.stem,
+            "total_frames": n_frames,
+            "fps": fps,
+            "duration_seconds": duration
+        })
+
+        # ======================================================
+        # GERAR RUIDO PARA CADA FRAME
+        # ======================================================
+
+        for f in frames_info:
+            img_path = PATH_BASE / f["frame_path"]
+            img = imageio.imread(img_path)
+
+            print(f"[DEBUG] Gerando ruídos para frame: {img_path}")
+
+            for intensity in NOISE_LEVELS:
+                noisy = generate_noise_sweep(img, intensity)
+
+                out_name = (
+                    f"{f['video_id']}_frame_{f['frame_index']:04d}_noise_{intensity:.1f}.png"
+                )
+
+                out_path = NOISE_OUT / out_name
+                imageio.imwrite(out_path, noisy)
+
+                print(f"[DEBUG] → Ruído {intensity:.1f} salvo: {out_path}")
+
+                all_noise.append({
+                    "video_id": f["video_id"],
+                    "frame_index": f["frame_index"],
+                    "original_frame_path": f["frame_path"],
+                    "noisy_frame_path": str(out_path.relative_to(PATH_BASE)),
+                    "noise_intensity": intensity
+                })
+
+    # ======================================================
+    # SALVAR CSVs
+    # ======================================================
+
+    print("\n[DEBUG] Salvando CSVs...")
+
+    with open(CSV_FRAMES, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["video_id", "frame_index", "frame_path"])
+        w.writeheader()
+        w.writerows(all_frames)
+
+    with open(CSV_NOISE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "video_id", "frame_index",
+            "original_frame_path", "noisy_frame_path",
+            "noise_intensity"
+        ])
+        w.writeheader()
+        w.writerows(all_noise)
+
+    with open(CSV_VIDEOS, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "video_id", "total_frames", "fps", "duration_seconds"
+        ])
+        w.writeheader()
+        w.writerows(all_video_info)
+
+    print("\n✔ PROCESSO FINALIZADO!")
+    print("Arquivos gerados:")
+    print(" -", CSV_FRAMES)
+    print(" -", CSV_NOISE)
+    print(" -", CSV_VIDEOS)
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
-    process_all()
+    process_all_videos()
